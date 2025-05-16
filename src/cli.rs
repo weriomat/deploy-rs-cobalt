@@ -5,8 +5,10 @@
 
 use std::collections::HashMap;
 use std::io::{stdin, stdout, Write};
+use std::str::Utf8Error;
 
-use clap::{ArgMatches, Parser, FromArgMatches};
+use clap::{ArgMatches, FromArgMatches, Parser};
+use tokio::fs::try_exists;
 
 use crate as deploy;
 
@@ -383,9 +385,9 @@ pub enum RunDeployError {
     #[error("Failed to deploy profile to node {0}: {1}")]
     DeployProfile(String, deploy::deploy::DeployProfileError),
     #[error("Failed to build profile on node {0}: {0}")]
-    BuildProfile(String,  deploy::push::PushProfileError),
+    BuildProfile(String, deploy::push::PushProfileError),
     #[error("Failed to push profile to node {0}: {0}")]
-    PushProfile(String,  deploy::push::PushProfileError),
+    PushProfile(String, deploy::push::PushProfileError),
     #[error("No profile named `{0}` was found")]
     ProfileNotFound(String),
     #[error("No node named `{0}` was found")]
@@ -401,7 +403,9 @@ pub enum RunDeployError {
     #[error("Failed to revoke profile for node {0}: {1}")]
     RevokeProfile(String, deploy::deploy::RevokeProfileError),
     #[error("Deployment to node {0} failed, rolled back to previous generation")]
-    Rollback(String)
+    Rollback(String),
+    #[error("Failed to get the password for sops {0}")]
+    Sops(#[from] deploy::cli::SopsError),
 }
 
 type ToDeploy<'a> = Vec<(
@@ -545,20 +549,103 @@ async fn run_deploy(
 
         let mut deploy_defs = deploy_data.defs()?;
 
-        if deploy_data.merged_settings.interactive_sudo.unwrap_or(false) {
+        if deploy_data.merged_settings.sudo.is_some()
+            && (deploy_data.merged_settings.interactive_sudo.is_some()
+                || deploy_data.merged_settings.sudo_secret.is_some())
+        {
+            warn!("Custom sudo commands should be configured to accept password input from stdin when using the 'interactive sudo' or 'password File' option. Deployment may fail if the custom command ignores stdin.");
+        } else {
+            // this configures sudo to hide the password prompt and accept input from stdin
+            // at the time of writing, deploy_defs.sudo defaults to 'sudo -u root' when using user=root and sshUser as non-root
+            let original = deploy_defs.sudo.unwrap_or("sudo".to_string());
+            deploy_defs.sudo = Some(format!("{} -S -p \"\"", original));
+        }
+
+        if deploy_data
+            .merged_settings
+            .interactive_sudo
+            .unwrap_or(false)
+        {
             warn!("Interactive sudo is enabled! Using a sudo password is less secure than correctly configured SSH keys.\nPlease use keys in production environments.");
 
-            if deploy_data.merged_settings.sudo.is_some() {
-                warn!("Custom sudo commands should be configured to accept password input from stdin when using the 'interactive sudo' option. Deployment may fail if the custom command ignores stdin.");
-            } else {
-                // this configures sudo to hide the password prompt and accept input from stdin
-                // at the time of writing, deploy_defs.sudo defaults to 'sudo -u root' when using user=root and sshUser as non-root
-                let original = deploy_defs.sudo.unwrap_or("sudo".to_string());
-                deploy_defs.sudo = Some(format!("{} -S -p \"\"", original));
+            info!(
+                "You will now be prompted for the sudo password for {}.",
+                node.node_settings.hostname
+            );
+
+            let sudo_password = rpassword::prompt_password(format!(
+                "(sudo for {}) Password: ",
+                node.node_settings.hostname
+            ))
+            .unwrap_or("".to_string());
+
+            deploy_defs.sudo_password = Some(sudo_password);
+        }
+
+        if deploy_data.merged_settings.sudo_file.is_some()
+            && deploy_data.merged_settings.sudo_secret.is_some()
+        {
+            // SAFETY: we already checked if it is some
+            let path = deploy_data.merged_settings.sudo_file.clone().unwrap();
+            let key = deploy_data.merged_settings.sudo_secret.clone().unwrap();
+
+            if !try_exists(&path).await.unwrap() {
+                return Err(RunDeployError::Sops(SopsError::SopsFileNotFound(format!(
+                    "{path:?} not found"
+                ))));
             }
 
-            info!("You will now be prompted for the sudo password for {}.", node.node_settings.hostname);
-            let sudo_password = rpassword::prompt_password(format!("(sudo for {}) Password: ", node.node_settings.hostname)).unwrap_or("".to_string());
+            // We deserialze to json
+            let out = Command::new("sops")
+                .arg("--output-type")
+                .arg("json")
+                .arg("-d")
+                .arg(path)
+                .output()
+                .await
+                .expect("Failed to execute sops");
+
+            // We check if sops is in path
+            if out.status.code() == Some(127) {
+                return Err(RunDeployError::Sops(SopsError::SopsNotFound(
+                    "sops binary not found".into(),
+                )));
+            }
+
+            let conv_out = std::str::from_utf8(&out.stdout)
+                .map_err(|err| RunDeployError::Sops(SopsError::SopsCannotConvert(err)))?;
+
+            let mut m: serde_json::Map<String, serde_json::Value> = serde_json::from_str(conv_out)
+                .map_err(|err| RunDeployError::Sops(SopsError::SerdeDeserialize(err)))?;
+
+            let mut sudo_password = String::new();
+
+            // We support nested keys like a/b/c
+            for i in key.split('/') {
+                match m.get(i) {
+                    Some(v) => match v {
+                        serde_json::Value::String(s) => {
+                            sudo_password = s.into();
+                        }
+                        serde_json::Value::Object(map) => {
+                            m = map.clone();
+                        }
+                        _ => {
+                            return Err(RunDeployError::Sops(SopsError::SerdeUnexpectedType(
+                                "We dont handle Arrays, Bools, None, Numbers".into(),
+                            )));
+                        }
+                    },
+                    None => {
+                        return Err(RunDeployError::Sops(SopsError::SopsKeyNotFound(format!(
+                            "Did not find {} in Map",
+                            i
+                        ))));
+                    }
+                }
+            }
+
+            println!("Password {sudo_password}");
 
             deploy_defs.sudo_password = Some(sudo_password);
         }
@@ -589,16 +676,16 @@ async fn run_deploy(
 
     for data in data_iter() {
         let node_name: String = data.deploy_data.node_name.to_string();
-        deploy::push::build_profile(data).await.map_err(|e| {
-            RunDeployError::BuildProfile(node_name, e)
-        })?;
+        deploy::push::build_profile(data)
+            .await
+            .map_err(|e| RunDeployError::BuildProfile(node_name, e))?;
     }
 
     for data in data_iter() {
         let node_name: String = data.deploy_data.node_name.to_string();
-        deploy::push::push_profile(data).await.map_err(|e| {
-            RunDeployError::PushProfile(node_name, e)
-        })?;
+        deploy::push::push_profile(data)
+            .await
+            .map_err(|e| RunDeployError::PushProfile(node_name, e))?;
     }
 
     let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs)> = vec![];
@@ -608,7 +695,8 @@ async fn run_deploy(
     // Rollbacks adhere to the global seeting to auto_rollback and secondary
     // the profile's configuration
     for (_, deploy_data, deploy_defs) in &parts {
-        if let Err(e) = deploy::deploy::deploy_profile(deploy_data, deploy_defs, dry_activate, boot).await
+        if let Err(e) =
+            deploy::deploy::deploy_profile(deploy_data, deploy_defs, dry_activate, boot).await
         {
             error!("{}", e);
             if dry_activate {
@@ -621,19 +709,40 @@ async fn run_deploy(
                 //  the command line)
                 for (deploy_data, deploy_defs) in &succeeded {
                     if deploy_data.merged_settings.auto_rollback.unwrap_or(true) {
-                        deploy::deploy::revoke(*deploy_data, *deploy_defs).await.map_err(|e| {
-                            RunDeployError::RevokeProfile(deploy_data.node_name.to_string(), e)
-                        })?;
+                        deploy::deploy::revoke(*deploy_data, *deploy_defs)
+                            .await
+                            .map_err(|e| {
+                                RunDeployError::RevokeProfile(deploy_data.node_name.to_string(), e)
+                            })?;
                     }
                 }
                 return Err(RunDeployError::Rollback(deploy_data.node_name.to_string()));
             }
-            return Err(RunDeployError::DeployProfile(deploy_data.node_name.to_string(), e))
+            return Err(RunDeployError::DeployProfile(
+                deploy_data.node_name.to_string(),
+                e,
+            ));
         }
         succeeded.push((deploy_data, deploy_defs))
     }
 
     Ok(())
+}
+
+#[derive(Error, Debug)]
+pub enum SopsError {
+    #[error("Failed to find sops binary: {0}")]
+    SopsNotFound(String),
+    #[error("Failed to find sops file: {0}")]
+    SopsFileNotFound(String),
+    #[error("Failed to convert the output of sops to a str: {0}")]
+    SopsCannotConvert(Utf8Error),
+    #[error("Failed to deserialize: {0}")]
+    SerdeDeserialize(serde_json::Error),
+    #[error("Error unexpected type: {0}")]
+    SerdeUnexpectedType(String),
+    #[error("Failed to find key: {0}")]
+    SopsKeyNotFound(String),
 }
 
 #[derive(Error, Debug)]
@@ -698,7 +807,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         dry_activate: opts.dry_activate,
         remote_build: opts.remote_build,
         sudo: opts.sudo,
-        interactive_sudo: opts.interactive_sudo
+        interactive_sudo: opts.interactive_sudo,
     };
 
     let supports_flakes = test_flake_support().await.map_err(RunError::FlakeTest)?;

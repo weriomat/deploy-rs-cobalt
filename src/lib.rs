@@ -352,6 +352,12 @@ enum ProfileInfo {
 pub enum DeployDataDefsError {
     #[error("Neither `user` nor `sshUser` are set for profile {0} of node {1}")]
     NoProfileUser(String, String),
+    #[error("No sudo path set but sudo secret for profile {0} of node {1}")]
+    NoSopsFile(String, String),
+    #[error("No sudo secret but sudo path set for profile {0} of node {1}")]
+    NoSopsSecret(String, String),
+    #[error("No sudo secret but sudo path set for profile {0} of node {1}")]
+    SopsButInteractive(String, String),
 }
 
 impl<'a> DeployData<'a> {
@@ -367,6 +373,29 @@ impl<'a> DeployData<'a> {
             Some(ref user) if user != &ssh_user => Some(format!("{} {}", self.get_sudo(), user)),
             _ => None,
         };
+
+        // Check if one of sudo_file or sudo_secret is missing
+        if self.merged_settings.sudo_file.is_some() && self.merged_settings.sudo_secret.is_none() {
+            return Err(DeployDataDefsError::NoSopsSecret(
+                self.profile_name.to_owned(),
+                self.node_name.to_owned(),
+            ));
+        }
+        if self.merged_settings.sudo_file.is_none() && self.merged_settings.sudo_secret.is_some() {
+            return Err(DeployDataDefsError::NoSopsFile(
+                self.profile_name.to_owned(),
+                self.node_name.to_owned(),
+            ));
+        }
+
+        if self.merged_settings.interactive_sudo.is_some()
+            && self.merged_settings.sudo_secret.is_some()
+        {
+            return Err(DeployDataDefsError::SopsButInteractive(
+                self.profile_name.to_owned(),
+                self.node_name.to_owned(),
+            ));
+        }
 
         Ok(DeployDefs {
             ssh_user,
@@ -401,15 +430,21 @@ impl<'a> DeployData<'a> {
 
     fn get_profile_info(&'a self) -> Result<ProfileInfo, DeployDataDefsError> {
         match self.profile.profile_settings.profile_path {
-            Some(ref profile_path) => Ok(ProfileInfo::ProfilePath { profile_path: profile_path.to_string() }),
+            Some(ref profile_path) => Ok(ProfileInfo::ProfilePath {
+                profile_path: profile_path.to_string(),
+            }),
             None => {
                 let profile_user = self.get_profile_user()?;
-                Ok(ProfileInfo::ProfileUserAndName { profile_user, profile_name: self.profile_name.to_string() })
-            },
+                Ok(ProfileInfo::ProfileUserAndName {
+                    profile_user,
+                    profile_name: self.profile_name.to_string(),
+                })
+            }
         }
     }
 }
 
+// TODO: update if we touch the cli
 pub fn make_deploy_data<'a, 's>(
     top_settings: &'s data::GenericSettings,
     node: &'a data::Node,
